@@ -4,7 +4,7 @@ import click
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
-from src.finance_variance import ReportConfig
+from src.finance_variance import ReportConfig, ExcelColorConfig
 from src.finance_variance.report_generator import FinanceVarianceReportGenerator
 
 
@@ -35,14 +35,32 @@ def cli():
 @click.option('--top-n', default=10, type=int,
               help='显示Top N异常 (默认: 10)')
 @click.option('--start-period', default=None,
-              help='分析起始期间，如"1月" (默认: 所有期间)')
+              help='分析起始期间，如"1月"或"2024年第1季度" (默认: 所有期间)')
 @click.option('--end-period', default=None,
-              help='分析结束期间，如"6月" (默认: 所有期间)')
+              help='分析结束期间，如"6月"或"2024年第3季度" (默认: 所有期间)')
+@click.option('--cause-templates', default=None, type=click.Path(),
+              help='成因模板YAML配置文件路径 (默认: config/cause_templates.yaml)')
+@click.option('--separate-groups/--no-separate-groups', default=True,
+              help='异常排序是否按超支/节省分组 (默认: 开启)')
+@click.option('--color-level1', default=0.05, type=float,
+              help='Excel颜色一级阈值 (默认: 0.05，即5%)')
+@click.option('--color-level2', default=0.10, type=float,
+              help='Excel颜色二级阈值 (默认: 0.10，即10%)')
+@click.option('--color-level3', default=0.20, type=float,
+              help='Excel颜色三级阈值 (默认: 0.20，即20%)')
 def generate(budget, actual, output_dir, filename, file_type, company,
-             title, threshold, top_n, start_period, end_period):
+             title, threshold, top_n, start_period, end_period,
+             cause_templates, separate_groups,
+             color_level1, color_level2, color_level3):
     """生成财务差异报告"""
     try:
         click.echo('🚀 开始生成财务差异报告...')
+
+        color_config = ExcelColorConfig(
+            level1_threshold=color_level1,
+            level2_threshold=color_level2,
+            level3_threshold=color_level3
+        )
 
         config = ReportConfig(
             title=title,
@@ -50,7 +68,10 @@ def generate(budget, actual, output_dir, filename, file_type, company,
             anomaly_threshold=threshold,
             top_n_anomalies=top_n,
             start_period=start_period,
-            end_period=end_period
+            end_period=end_period,
+            cause_templates_path=cause_templates,
+            separate_anomaly_groups=separate_groups,
+            excel_color_config=color_config
         )
 
         generator = FinanceVarianceReportGenerator(config)
@@ -64,6 +85,11 @@ def generate(budget, actual, output_dir, filename, file_type, company,
         click.echo('🔍 检测异常...')
         anomalies, anomalies_df = generator.detect_anomalies()
         click.echo(f'   发现 {len(anomalies)} 个异常项')
+        if separate_groups and '分组' in anomalies_df.columns:
+            bad = anomalies_df[anomalies_df['分组'] == '超支组']
+            good = anomalies_df[anomalies_df['分组'] == '节省组']
+            click.echo(f'   ├─ 超支组（不利）: {len(bad)} 个')
+            click.echo(f'   └─ 节省组（有利）: {len(good)} 个')
 
         click.echo('📝 生成报告...')
         md_path, xlsx_path = generator.generate_all(output_dir, filename)
@@ -74,13 +100,68 @@ def generate(budget, actual, output_dir, filename, file_type, company,
 
     except Exception as e:
         click.echo(f'\n❌ 错误: {str(e)}', err=True)
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
+
+
+@cli.command()
+@click.option('--template-path', '-p', default=None, type=click.Path(),
+              help='模板文件路径 (默认: config/cause_templates.yaml)')
+def init_cause_templates(template_path):
+    """生成默认成因模板YAML文件，供运营自定义"""
+    import yaml
+    default_path = template_path or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        'config', 'cause_templates.yaml'
+    )
+    os.makedirs(os.path.dirname(default_path), exist_ok=True)
+
+    default_templates = {
+        'revenue_unfavorable': [
+            '【待核实】市场需求下降，实际销量低于预期',
+            '【待核实】产品定价策略调整，客单价下降',
+            '【待核实】主要客户流失或订单延迟确认',
+            '【待核实】季节性因素影响本期收入确认'
+        ],
+        'revenue_favorable': [
+            '【待核实】市场推广活动效果超预期，新增客户贡献显著',
+            '【待核实】高毛利产品销售占比提升',
+            '【待核实】本期确认了往期延迟的大额订单',
+            '【待核实】产品成功提价且销量未受明显影响'
+        ],
+        'cost_unfavorable': [
+            '【待核实】原材料价格上涨超出预算',
+            '【待核实】产能利用率不足导致单位固定成本上升',
+            '【待核实】一次性费用支出或预算外开支',
+            '【待核实】人员成本增加（新增编制/加班/奖金）'
+        ],
+        'cost_favorable': [
+            '【待核实】供应链优化或集中采购降低了原材料成本',
+            '【待核实】费用管控措施见效，各项开支节约',
+            '【待核实】部分预算内项目延期至下期执行',
+            '【待核实】产能利用率提升摊薄了单位固定成本'
+        ]
+    }
+
+    with open(default_path, 'w', encoding='utf-8') as f:
+        yaml.dump(default_templates, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+
+    click.echo(f'✅ 默认成因模板已生成: {default_path}')
+    click.echo('📝 运营团队可直接编辑此文件自定义成因说明，无需修改代码。')
 
 
 @cli.command()
 def version():
     """显示版本信息"""
-    click.echo('财务差异报告生成器 v1.0.0')
+    click.echo('财务差异报告生成器 v1.1.0')
+    click.echo('')
+    click.echo('v1.1.0 补丁更新:')
+    click.echo('  • 修复: 相对差异公式 budget=0 时返回 inf/None，避免 ZeroDivisionError')
+    click.echo('  • 新增: 异常排序拆分超支/节省两组，分别按金额排序')
+    click.echo('  • 新增: 成因占位符挪到 YAML 配置，支持运营自定义')
+    click.echo('  • 新增: Excel 单元格颜色阈值三档可调（config 配置）')
+    click.echo('  • 新增: 多期日期解析支持 "YYYY 第 Q 季度" 文本格式')
 
 
 if __name__ == '__main__':
