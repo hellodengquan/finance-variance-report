@@ -1,6 +1,6 @@
 import math
 import pandas as pd
-from typing import List, Dict, Optional
+from typing import List, Dict
 from .models import FinancialData, VarianceResult, ReportConfig
 
 
@@ -8,7 +8,7 @@ class VarianceCalculator:
     """差异计算引擎"""
 
     def __init__(self, budget_data: FinancialData, actual_data: FinancialData,
-                 config: Optional[ReportConfig] = None):
+                 config: ReportConfig = None):
         self.budget_data = budget_data
         self.actual_data = actual_data
         self.config = config or ReportConfig()
@@ -42,31 +42,45 @@ class VarianceCalculator:
         return all_periods
 
     @staticmethod
-    def safe_divide(numerator: float, denominator: float) -> Optional[float]:
+    def classify_divide_case(numerator: float, denominator: float) -> str:
         """
-        安全除法，避免ZeroDivisionError
+        分类除零语义（展示层渲染用）
 
-        - denominator == 0 and numerator > 0: 返回 +inf
-        - denominator == 0 and numerator < 0: 返回 -inf
-        - denominator == 0 and numerator == 0: 返回 None
-        - 正常情况: 返回 numerator / denominator
+        Returns:
+            'normal'       -> 正常除法
+            'positive_inf' -> budget=0, actual>0  (正无穷)
+            'negative_inf' -> budget=0, actual<0  (负无穷)
+            'both_zero'    -> budget=0, actual=0  (N/A)
+        """
+        if denominator != 0:
+            return 'normal'
+        if numerator > 0:
+            return 'positive_inf'
+        if numerator < 0:
+            return 'negative_inf'
+        return 'both_zero'
+
+    @staticmethod
+    def safe_divide(numerator: float, denominator: float) -> float:
+        """
+        安全除法，统一用 NaN 表示异常除零语义（保证 pandas float64 列类型一致）
+
+        - denominator != 0       -> 返回 numerator / denominator
+        - denominator == 0 (所有情况) -> 返回 float('nan')
+
+        展示层需要区分 ∞% / N/A 时，用 classify_divide_case(numerator, denominator) 判定。
         """
         if denominator == 0:
-            if numerator > 0:
-                return float('inf')
-            elif numerator < 0:
-                return float('-inf')
-            else:
-                return None
+            return float('nan')
         return numerator / denominator
 
     @staticmethod
-    def format_relative_variance_pct(rel_var: Optional[float]) -> Optional[float]:
-        """格式化相对差异为百分比（保留2位小数），处理None和inf情况"""
+    def format_relative_variance_pct(rel_var: float) -> float:
+        """格式化相对差异为百分比（保留2位小数），NaN 保持 NaN"""
         if rel_var is None:
-            return None
-        if math.isinf(rel_var):
-            return float('inf') if rel_var > 0 else float('-inf')
+            return float('nan')
+        if math.isnan(rel_var) or math.isinf(rel_var):
+            return float('nan')
         return round(rel_var * 100, 2)
 
     def calculate_variances(self) -> List[VarianceResult]:
@@ -110,24 +124,25 @@ class VarianceCalculator:
         return results
 
     def to_dataframe(self, results: List[VarianceResult]) -> pd.DataFrame:
-        """将计算结果转换为DataFrame"""
+        """将计算结果转换为DataFrame（列类型统一 float64）"""
         data = []
         for r in results:
             data.append({
                 '科目编码': r.account_code,
                 '科目名称': r.account_name,
                 '期间': r.period,
-                '预算金额': r.budget,
-                '实际金额': r.actual,
-                '绝对差异': r.absolute_variance,
+                '预算金额': float(r.budget),
+                '实际金额': float(r.actual),
+                '绝对差异': float(r.absolute_variance),
                 '相对差异(%)': self.format_relative_variance_pct(r.relative_variance),
-                '累计预算': r.cumulative_budget,
-                '累计实际': r.cumulative_actual,
-                '累计偏离': r.cumulative_variance,
+                '累计预算': float(r.cumulative_budget),
+                '累计实际': float(r.cumulative_actual),
+                '累计偏离': float(r.cumulative_variance),
                 '累计相对偏离(%)': self.format_relative_variance_pct(r.cumulative_relative_variance)
             })
 
-        return pd.DataFrame(data)
+        df = pd.DataFrame(data)
+        return df
 
     def get_summary_by_account(self, results: List[VarianceResult]) -> pd.DataFrame:
         """按科目汇总差异"""
@@ -159,10 +174,6 @@ class VarianceCalculator:
             '绝对差异': 'sum',
             '累计偏离': 'last'
         }).reset_index()
-
-        from .models import PeriodParser
-        summary['_sort_key'] = summary['期间'].apply(lambda x: PeriodParser.parse(x)[0])
-        summary = summary.sort_values('_sort_key').drop(columns=['_sort_key']).reset_index(drop=True)
 
         rel_vars = []
         for _, row in summary.iterrows():

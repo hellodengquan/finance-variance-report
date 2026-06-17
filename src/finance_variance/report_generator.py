@@ -1,7 +1,8 @@
 import os
-from typing import Optional, Tuple
+import yaml
+from typing import Optional, Tuple, List, Dict
 import pandas as pd
-from .models import ReportConfig, VarianceResult, AnomalyItem
+from .models import ReportConfig, VarianceResult, AnomalyItem, ExcelColorConfig
 from .data_loader import DataLoader
 from .variance_calculator import VarianceCalculator
 from .anomaly_detector import AnomalyDetector
@@ -14,6 +15,8 @@ class FinanceVarianceReportGenerator:
 
     def __init__(self, config: Optional[ReportConfig] = None):
         self.config = config or ReportConfig()
+        self._apply_yaml_color_if_present()
+
         self.data_loader = DataLoader()
         self.variance_calculator: Optional[VarianceCalculator] = None
         self.anomaly_detector = AnomalyDetector(self.config)
@@ -28,6 +31,40 @@ class FinanceVarianceReportGenerator:
         self.period_summary = None
         self.anomalies = None
         self.anomalies_df = None
+
+    def _apply_yaml_color_if_present(self) -> None:
+        """
+        若 cause_templates_path 指向的 YAML 中含 excel_colors / color_config 节，
+        则将其加载到 self.config.excel_color_config，供运营配置企业色。
+        """
+        yaml_path = self.config.cause_templates_path
+        if not (yaml_path and os.path.exists(yaml_path)):
+            return
+        try:
+            with open(yaml_path, 'r', encoding='utf-8') as f:
+                data = yaml.safe_load(f)
+            if not isinstance(data, dict):
+                return
+            color_dict = data.get('excel_colors') or data.get('color_config')
+            if isinstance(color_dict, dict):
+                self.config.excel_color_config = ExcelColorConfig.from_dict(color_dict)
+        except Exception:
+            pass
+
+    def get_anomaly_groups(self, anomalies: Optional[List[AnomalyItem]] = None) -> Dict[str, List[AnomalyItem]]:
+        """
+        合并 Top-N 接口的补充：将 detect_anomalies() 返回的完整异常列表
+        按「超支组/节省组」切片，客户端一次拿齐两组数据。
+
+        Args:
+            anomalies: 异常列表，默认为上次 detect_anomalies 的结果
+
+        Returns:
+            {'超支组': [...], '节省组': [...]}
+        """
+        if anomalies is None:
+            anomalies = self.anomalies or []
+        return self.anomaly_detector.get_anomaly_groups(anomalies)
 
     def load_data(self, budget_path: str, actual_path: str,
                   file_type: str = 'csv',

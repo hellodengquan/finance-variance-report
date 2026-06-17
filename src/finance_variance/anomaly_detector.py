@@ -1,5 +1,6 @@
 import os
 import math
+import warnings
 import pandas as pd
 from typing import List, Dict, Optional, Tuple
 import yaml
@@ -58,12 +59,23 @@ DEFAULT_CAUSE_TEMPLATES = {
 }
 
 
+_VALID_YAML_KEYS = {
+    'revenue_unfavorable', 'revenue_favorable',
+    'cost_unfavorable', 'cost_favorable',
+    'revenue_positive', 'revenue_negative',
+    'cost_positive', 'cost_negative',
+    'cause_templates',
+    'actions', 'note',
+    'excel_colors', 'color_config'
+}
+
+
 class AnomalyDetector:
     """异常检测和排序模块"""
 
     def __init__(self, config: Optional[ReportConfig] = None):
         self.config = config or ReportConfig()
-        self.cause_templates = self._load_cause_templates()
+        self.cause_templates, self.yaml_warnings = self._load_cause_templates()
 
     @staticmethod
     def _map_yaml_key(yaml_key: str) -> Optional[str]:
@@ -82,89 +94,93 @@ class AnomalyDetector:
         }
         return mapping.get(yaml_key)
 
-    def _load_cause_templates(self) -> Dict:
-        """从YAML文件或默认值加载成因模板
+    def _load_cause_templates(self) -> Tuple[Dict, List[str]]:
+        """从YAML文件或默认值加载成因模板，同时返回未知键的警告列表
 
-        支持两种 YAML 结构：
-        A) 简洁格式（运营常用，cli.py init 命令生成）：
-            revenue_unfavorable:
-              - 【待核实】xxx
-            cost_favorable:
-              - 【待核实】yyy
-
-        B) 嵌套格式（结构化配置）：
-            cause_templates:
-              revenue_positive:
-                description: xxx
-                templates: [...]
+        - 严格校验字段名，未知键写入 warnings 并通过 warnings.warn() 提示
+        - 运营拼写错误（如 revenue_unfavorabl）不会静默降级
         """
         templates = {k: dict(v) for k, v in DEFAULT_CAUSE_TEMPLATES.items()}
+        warning_msgs: List[str] = []
 
         yaml_path = self.config.cause_templates_path
-        if yaml_path and os.path.exists(yaml_path):
-            try:
-                with open(yaml_path, 'r', encoding='utf-8') as f:
-                    yaml_data = yaml.safe_load(f)
+        if not (yaml_path and os.path.exists(yaml_path)):
+            return templates, warning_msgs
 
-                if not yaml_data:
-                    return templates
+        try:
+            with open(yaml_path, 'r', encoding='utf-8') as f:
+                yaml_data = yaml.safe_load(f)
 
-                applied = False
+            if not yaml_data:
+                return templates, warning_msgs
 
-                if isinstance(yaml_data, dict):
-                    for key, value in yaml_data.items():
-                        internal_key = self._map_yaml_key(key)
-                        if internal_key and isinstance(value, list):
-                            templates[internal_key] = {
-                                'description': f'YAML配置: {key}',
-                                'templates': [str(x) for x in value]
-                            }
-                            applied = True
-                            continue
+            def _emit_warning(key, reason):
+                msg = f"[成因模板] YAML 字段 '{key}' {reason} (文件: {yaml_path})"
+                warning_msgs.append(msg)
+                warnings.warn(msg, UserWarning, stacklevel=2)
 
-                        if internal_key and isinstance(value, dict) and 'templates' in value:
+            known_valid_keys = set(_VALID_YAML_KEYS)
+
+            if isinstance(yaml_data, dict):
+                for key, value in yaml_data.items():
+                    if key in ('excel_colors', 'color_config', 'actions', 'note'):
+                        continue
+                    if key not in known_valid_keys:
+                        _emit_warning(key, "不被识别，已忽略。请检查拼写是否正确")
+                        continue
+
+                    internal_key = self._map_yaml_key(key) or key
+                    if isinstance(value, list):
+                        templates[internal_key] = {
+                            'description': f'YAML配置: {key}',
+                            'templates': [str(x) for x in value]
+                        }
+                    elif isinstance(value, dict):
+                        if 'templates' in value:
                             templates[internal_key] = {
                                 'description': value.get('description', f'YAML配置: {key}'),
                                 'templates': list(value['templates'])
                             }
-                            applied = True
+                        else:
+                            _emit_warning(key, "缺少 templates 列表，已忽略")
+                    else:
+                        _emit_warning(key, "值必须是列表或含 templates 的字典，已忽略")
+
+                if 'cause_templates' in yaml_data and isinstance(yaml_data['cause_templates'], dict):
+                    for key, value in yaml_data['cause_templates'].items():
+                        if key not in known_valid_keys:
+                            _emit_warning(f"cause_templates.{key}", "不被识别，已忽略")
                             continue
+                        internal_key = self._map_yaml_key(key) or key
+                        if isinstance(value, list):
+                            templates[internal_key] = {
+                                'description': f'YAML配置: {key}',
+                                'templates': [str(x) for x in value]
+                            }
+                        elif isinstance(value, dict) and 'templates' in value:
+                            templates[internal_key] = {
+                                'description': value.get('description', ''),
+                                'templates': list(value['templates'])
+                            }
 
-                    if 'cause_templates' in yaml_data and isinstance(yaml_data['cause_templates'], dict):
-                        for key, value in yaml_data['cause_templates'].items():
-                            internal_key = self._map_yaml_key(key) or key
-                            if isinstance(value, list):
-                                templates[internal_key] = {
-                                    'description': f'YAML配置: {key}',
-                                    'templates': [str(x) for x in value]
-                                }
-                                applied = True
-                            elif isinstance(value, dict) and 'templates' in value:
-                                templates[internal_key] = {
-                                    'description': value.get('description', ''),
-                                    'templates': list(value['templates'])
-                                }
-                                applied = True
+        except Exception as e:
+            msg = f"[成因模板] 加载YAML失败: {e}，使用默认模板 (文件: {yaml_path})"
+            warning_msgs.append(msg)
+            warnings.warn(msg, UserWarning, stacklevel=2)
 
-            except Exception as e:
-                print(f"[警告] 加载成因模板YAML失败: {e}，使用默认模板")
-
-        return templates
+        return templates, warning_msgs
 
     def detect_anomalies(self, variance_results: List[VarianceResult],
                          variance_df: Optional[pd.DataFrame] = None) -> List[AnomalyItem]:
         """
-        检测异常项并按影响排序
+        检测异常项并按影响排序（超支/节省已合并成单一 Top-N 列表）
 
-        若 config.separate_anomaly_groups=True，则将异常拆分为超支组和节省组，
-        组内分别按绝对差异金额从大到小排序，最后按 超支、节省 的顺序合并。
+        - 若 config.separate_anomaly_groups=True：异常先按「超支组」「节省组」拆分，
+          组内分别按绝对差异金额降序，再按 超支组+节省组 合并，返回合并后的 Top N；
+          DataFrame 列含「分组」供展示层使用。
+        - 若 config.separate_anomaly_groups=False：按影响分数综合排序。
 
-        Args:
-            variance_results: 差异计算结果列表
-            variance_df: 差异数据DataFrame（可选，用于计算整体影响）
-
-        Returns:
-            排序后的异常项列表
+        客户端只需调用一次即可拿到完整异常列表。
         """
         if variance_df is None:
             variance_df = self._results_to_df(variance_results)
@@ -176,11 +192,17 @@ class AnomalyDetector:
 
         for result in variance_results:
             rel_var = result.relative_variance
-            if rel_var is None:
-                continue
 
-            abs_rel = abs(rel_var)
-            if not math.isinf(abs_rel) and abs_rel < self.config.anomaly_threshold:
+            if pd.isna(rel_var):
+                if result.budget == 0 and result.actual != 0:
+                    pass
+                else:
+                    continue
+
+            abs_rel = abs(rel_var) if not pd.isna(rel_var) else float('inf')
+            if abs_rel < self.config.anomaly_threshold and not pd.isna(rel_var):
+                continue
+            if not pd.isna(rel_var) and abs_rel < self.config.anomaly_threshold:
                 continue
 
             impact_score = self._calculate_impact_score(result, total_budget)
@@ -206,7 +228,6 @@ class AnomalyDetector:
         if self.config.separate_anomaly_groups:
             overspend_anomalies.sort(key=lambda x: abs(x.absolute_variance), reverse=True)
             saving_anomalies.sort(key=lambda x: abs(x.absolute_variance), reverse=True)
-
             combined = overspend_anomalies + saving_anomalies
             return combined[:self.config.top_n_anomalies]
         else:
@@ -214,7 +235,23 @@ class AnomalyDetector:
             all_anomalies.sort(key=lambda x: abs(x.impact_score), reverse=True)
             return all_anomalies[:self.config.top_n_anomalies]
 
-    def _is_overspend(self, result: VarianceResult, variance_type: str) -> bool:
+    def get_anomaly_groups(self, anomalies: List[AnomalyItem]) -> Dict[str, List[AnomalyItem]]:
+        """
+        合并 Top-N 接口的补充：将完整异常列表按分组返回，
+        便于客户端分别展示超支/节省组。
+        """
+        groups = {'超支组': [], '节省组': []}
+        for a in anomalies:
+            is_rev = (a.account_code.startswith('60') or a.account_code.startswith('63'))
+            if is_rev:
+                key = '超支组' if a.variance_type == 'revenue_negative' else '节省组'
+            else:
+                key = '超支组' if a.variance_type == 'cost_positive' else '节省组'
+            groups[key].append(a)
+        return groups
+
+    @staticmethod
+    def _is_overspend(result: VarianceResult, variance_type: str) -> bool:
         """
         判断是否为超支（对利润的不利影响）：
         - 收入类：实际 < 预算（revenue_negative）
@@ -222,7 +259,6 @@ class AnomalyDetector:
         """
         account_code = result.account_code
         is_revenue = (account_code.startswith('60') or account_code.startswith('63'))
-
         if is_revenue:
             return variance_type == 'revenue_negative'
         else:
@@ -233,12 +269,21 @@ class AnomalyDetector:
         计算影响分数，综合考虑绝对差异和相对差异
 
         影响分数 = 绝对差异 / 期间总预算 * 100% * 权重1 + 相对差异 * 权重2
+        NaN（budget=0 情况）按最大相对差异处理（+100 或 -100）
         """
         abs_impact = result.absolute_variance / total_budget * 100 if total_budget != 0 else 0
 
         rel_var = result.relative_variance
-        if rel_var is None or math.isinf(rel_var):
-            rel_impact = 100.0 if rel_var == float('inf') else (-100.0 if rel_var == float('-inf') else 0)
+        if pd.isna(rel_var):
+            if result.budget == 0:
+                if result.actual > 0:
+                    rel_impact = 100.0
+                elif result.actual < 0:
+                    rel_impact = -100.0
+                else:
+                    rel_impact = 0.0
+            else:
+                rel_impact = 0.0
         else:
             rel_impact = rel_var * 100
 
@@ -272,23 +317,17 @@ class AnomalyDetector:
         return templates[template_index]
 
     def _results_to_df(self, results: List[VarianceResult]) -> pd.DataFrame:
-        """将结果转换为DataFrame"""
+        """将结果转换为DataFrame（列类型统一 float64）"""
         data = []
         for r in results:
-            rel_var_pct = None
-            if r.relative_variance is not None:
-                if math.isinf(r.relative_variance):
-                    rel_var_pct = float('inf') if r.relative_variance > 0 else float('-inf')
-                else:
-                    rel_var_pct = r.relative_variance * 100
             data.append({
                 '科目编码': r.account_code,
                 '科目名称': r.account_name,
                 '期间': r.period,
-                '预算金额': r.budget,
-                '实际金额': r.actual,
-                '绝对差异': r.absolute_variance,
-                '相对差异(%)': rel_var_pct
+                '预算金额': float(r.budget),
+                '实际金额': float(r.actual),
+                '绝对差异': float(r.absolute_variance),
+                '相对差异(%)': float('nan') if pd.isna(r.relative_variance) else round(r.relative_variance * 100, 2)
             })
         return pd.DataFrame(data)
 
@@ -314,15 +353,13 @@ class AnomalyDetector:
                 return '不利差异', '超支组'
 
     def anomalies_to_dataframe(self, anomalies: List[AnomalyItem]) -> pd.DataFrame:
-        """将异常项转换为DataFrame"""
+        """将异常项转换为DataFrame（超支/节省已合并成单一 Top-N 列表，含分组列）"""
         data = []
         for idx, a in enumerate(anomalies, 1):
-            rel_var_pct = None
-            if a.relative_variance is not None:
-                if math.isinf(a.relative_variance):
-                    rel_var_pct = float('inf') if a.relative_variance > 0 else float('-inf')
-                else:
-                    rel_var_pct = round(a.relative_variance * 100, 2)
+            if pd.isna(a.relative_variance):
+                rel_var_pct = float('nan')
+            else:
+                rel_var_pct = round(a.relative_variance * 100, 2)
 
             display_type, group_label = self._get_display_types(a.account_code, a.variance_type)
 
@@ -331,8 +368,8 @@ class AnomalyDetector:
                 '科目编码': a.account_code,
                 '科目名称': a.account_name,
                 '期间': a.period,
-                '绝对差异': a.absolute_variance,
-                '相对差异(%)': rel_var_pct,
+                '绝对差异': float(a.absolute_variance),
+                '相对差异(%)': float(rel_var_pct),
                 '影响分数': round(a.impact_score, 2),
                 '差异类型': display_type,
                 '分组': group_label,

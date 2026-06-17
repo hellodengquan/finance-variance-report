@@ -4,6 +4,7 @@ import pandas as pd
 from datetime import datetime
 from typing import List, Optional
 from .models import ReportConfig, AnomalyItem, VarianceResult
+from .variance_calculator import VarianceCalculator
 
 
 class MarkdownReporter:
@@ -13,20 +14,39 @@ class MarkdownReporter:
         self.config = config or ReportConfig()
 
     @staticmethod
-    def _format_pct(value: Optional[float]) -> str:
-        """格式化百分比，处理 None 和 inf 情况"""
+    def _format_pct_from_values(value: Optional[float], budget: float, actual: float) -> str:
+        """
+        格式化百分比，通过 budget/actual 值精确判定语义
+
+        统一 NaN 语义下：
+        - budget != 0      -> 显示 +X.XX% / -X.XX%
+        - budget == 0 且 actual > 0  -> 显示 ∞%
+        - budget == 0 且 actual < 0  -> 显示 -∞%
+        - budget == 0 且 actual == 0 -> 显示 N/A
+        """
+        case = VarianceCalculator.classify_divide_case(actual - budget, budget)
+        if case == 'positive_inf':
+            return "∞%"
+        if case == 'negative_inf':
+            return "-∞%"
+        if case == 'both_zero':
+            return "N/A"
+
         if value is None:
             return "N/A"
-        if math.isinf(value):
-            return "∞%" if value > 0 else "-∞%"
-        if math.isnan(value):
+        try:
+            if math.isnan(value):
+                return "N/A"
+            if math.isinf(value):
+                return "∞%" if value > 0 else "-∞%"
+        except (TypeError, ValueError):
             return "N/A"
         return f"{value:+.2f}%"
 
     @staticmethod
     def _is_revenue_account(account_code: str) -> bool:
         """判断是否为收入类科目"""
-        return account_code.startswith('60') or account_code.startswith('63')
+        return str(account_code).startswith('60') or str(account_code).startswith('63')
 
     def generate(self,
                  variance_results: List[VarianceResult],
@@ -74,7 +94,7 @@ class MarkdownReporter:
 
         yaml_info = ""
         if self.config.cause_templates_path:
-            yaml_info = f"\n**成因模板配置**：`{self.config.cause_templates_path}`"
+            yaml_info = f"\n**成因&颜色模板配置**：`{self.config.cause_templates_path}`"
 
         color_cfg = self.config.excel_color_config
 
@@ -98,9 +118,8 @@ class MarkdownReporter:
         total_actual = account_summary['实际金额'].sum()
         total_variance = account_summary['绝对差异'].sum()
 
-        total_relative_pct = None
-        if total_budget != 0:
-            total_relative_pct = total_variance / total_budget * 100
+        total_relative_ratio = VarianceCalculator.safe_divide(total_variance, total_budget)
+        rel_str = self._format_pct_from_values(total_relative_ratio, total_budget, total_actual)
 
         favorable_count = len(account_summary[account_summary['绝对差异'] > 0])
         unfavorable_count = len(account_summary[account_summary['绝对差异'] < 0])
@@ -108,8 +127,6 @@ class MarkdownReporter:
 
         variance_status = "✅ 完成预算" if total_variance >= 0 else "❌ 未达预算"
         variance_class = "有利差异" if total_variance >= 0 else "不利差异"
-
-        rel_str = self._format_pct(total_relative_pct)
 
         return f"""## 一、总体概览
 
@@ -130,26 +147,34 @@ class MarkdownReporter:
 
 ### 整体评价
 
-{self._generate_overall_comment(total_variance, total_relative_pct, favorable_count, unfavorable_count)}
+{self._generate_overall_comment(total_variance, total_relative_ratio, total_budget, total_actual,
+                                 favorable_count, unfavorable_count)}
 """
 
-    def _generate_overall_comment(self, total_variance: float, total_relative_pct: Optional[float],
+    def _generate_overall_comment(self, total_variance: float, total_relative_ratio: float,
+                                  total_budget: float, total_actual: float,
                                   favorable_count: int, unfavorable_count: int) -> str:
         """生成整体评价"""
-        if total_relative_pct is None or math.isnan(total_relative_pct):
+        case = VarianceCalculator.classify_divide_case(total_variance, total_budget)
+        if case in ('positive_inf', 'negative_inf', 'both_zero'):
             severity = "差异率计算异常（预算为0），建议人工核查。"
-        elif abs(total_relative_pct) < 5:
-            severity = "整体表现平稳，差异在可控范围内。"
-        elif abs(total_relative_pct) < 10:
-            severity = "存在一定程度的差异，需要关注主要异常科目。"
         else:
-            severity = "差异较大，建议深入分析原因并采取相应措施。"
+            pct = abs(total_relative_ratio) * 100
+            if pct < 5:
+                severity = "整体表现平稳，差异在可控范围内。"
+            elif pct < 10:
+                severity = "存在一定程度的差异，需要关注主要异常科目。"
+            else:
+                severity = "差异较大，建议深入分析原因并采取相应措施。"
 
         var_str = self._format_number(abs(total_variance))
-        rel_str = self._format_pct(abs(total_relative_pct) if total_relative_pct is not None else None)
+        rel_str = self._format_pct_from_values(
+            abs(total_relative_ratio) if total_relative_ratio is not None else None,
+            total_budget, total_actual
+        )
 
         if total_variance >= 0:
-            return f"本期整体实现{self._format_number(total_variance)}的有利差异，差异率{self._format_pct(total_relative_pct)}。{severity}"
+            return f"本期整体实现{self._format_number(total_variance)}的有利差异，差异率{self._format_pct_from_values(total_relative_ratio, total_budget, total_actual)}。{severity}"
         else:
             return f"本期整体出现{var_str}的不利差异，差异率{rel_str}。{severity}"
 
@@ -160,11 +185,15 @@ class MarkdownReporter:
             variance_symbol = "+" if row['绝对差异'] >= 0 else ""
             status = "✅" if row['绝对差异'] >= 0 else "⚠️"
 
+            budget = float(row['预算金额'])
+            actual = float(row['实际金额'])
             rel_raw = row.get('相对差异(%)')
-            rel_str = self._format_pct(rel_raw)
-            if isinstance(rel_raw, (int, float)) and not math.isnan(rel_raw) and not math.isinf(rel_raw):
-                rel_symbol = "+" if rel_raw >= 0 else ""
-                rel_str = f"{rel_symbol}{rel_raw:.2f}%"
+
+            if isinstance(rel_raw, (int, float)) and not math.isnan(rel_raw):
+                rel_ratio = rel_raw / 100
+                rel_str = self._format_pct_from_values(rel_ratio, budget, actual)
+            else:
+                rel_str = self._format_pct_from_values(None, budget, actual)
 
             rows.append(
                 f"| {row['科目编码']} | {row['科目名称']} | {self._format_number(row['预算金额'])} | "
@@ -186,11 +215,14 @@ class MarkdownReporter:
             variance_symbol = "+" if row['绝对差异'] >= 0 else ""
             status = "✅" if row['绝对差异'] >= 0 else "⚠️"
 
+            budget = float(row['预算金额'])
+            actual = float(row['实际金额'])
             rel_raw = row.get('相对差异(%)')
-            rel_str = self._format_pct(rel_raw)
-            if isinstance(rel_raw, (int, float)) and not math.isnan(rel_raw) and not math.isinf(rel_raw):
-                rel_symbol = "+" if rel_raw >= 0 else ""
-                rel_str = f"{rel_symbol}{rel_raw:.2f}%"
+            if isinstance(rel_raw, (int, float)) and not math.isnan(rel_raw):
+                rel_ratio = rel_raw / 100
+                rel_str = self._format_pct_from_values(rel_ratio, budget, actual)
+            else:
+                rel_str = self._format_pct_from_values(None, budget, actual)
 
             rows.append(
                 f"| {row['期间']} | {self._format_number(row['预算金额'])} | "
@@ -225,7 +257,7 @@ class MarkdownReporter:
             bad_rows = self._build_anomaly_rows(bad_df, start_rank=1)
             good_rows = self._build_anomaly_rows(good_df, start_rank=1)
 
-            group_section = "（已按 超支组/节省组 分别按金额排序）"
+            group_section = "（已按 超支组/节省组 分别按金额排序，合并 Top-N 列表）"
         else:
             bad_rows = ""
             good_rows = ""
@@ -239,14 +271,16 @@ class MarkdownReporter:
         header_line = "| " + " | ".join(headers) + " |"
         sep_line = "|" + "|".join(["----------"] * len(headers)) + "|"
 
-        if has_group and self.config.separate_anomaly_groups:
-            n = len(headers)
-            empty_placeholder = "| " + " *（无）* |" * n
+        n = len(headers)
+        empty_placeholder = "| " + " *（无）* |" * n
 
+        if has_group and self.config.separate_anomaly_groups:
             return f"""## 四、重大异常分析（Top {len(anomalies_df)}）{group_section}
 
 > **说明**：相对差异超过 {self.config.anomaly_threshold * 100:.0f}% 的项标记为异常。
 > 超支组（不利影响）在前，节省组（有利影响）在后，组内按绝对差异金额从大到小排序。
+> 客户端可通过 `detect_anomalies()` 一次获取合并后的完整 Top-N 列表，再用
+> `get_anomaly_groups()` 按分组切片。
 
 ### 4.1 超支组（不利差异）
 
@@ -266,7 +300,7 @@ class MarkdownReporter:
 2. 对于重大不利差异，需制定相应的改进措施和时间节点
 3. 对于重大有利差异，需总结经验并考虑是否调整后续预算
 4. 所有成因核实后，请更新本报告中的"成因分析"字段
-5. 成因模板可在 `config/cause_templates.yaml` 中自定义，无需修改代码
+5. 成因模板与 Excel 企业色可在 `config/cause_templates.yaml` 中自定义，无需修改代码
 """
         else:
             return f"""## 四、重大异常分析（Top {len(anomalies_df)}）
@@ -283,7 +317,7 @@ class MarkdownReporter:
 2. 对于重大不利差异，需制定相应的改进措施和时间节点
 3. 对于重大有利差异，需总结经验并考虑是否调整后续预算
 4. 所有成因核实后，请更新本报告中的"成因分析"字段
-5. 成因模板可在 `config/cause_templates.yaml` 中自定义，无需修改代码
+5. 成因模板与 Excel 企业色可在 `config/cause_templates.yaml` 中自定义，无需修改代码
 """
 
     def _build_anomaly_rows(self, df: pd.DataFrame, start_rank: int = 1, has_group: bool = None) -> str:
@@ -301,11 +335,19 @@ class MarkdownReporter:
             variance_symbol = "+" if row['绝对差异'] >= 0 else ""
             type_icon = "✅" if row['差异类型'] == '有利差异' else "⚠️"
 
+            budget = float(row.get('预算金额', 0)) if '预算金额' in df.columns else 0
+            actual = float(row.get('实际金额', 0)) if '实际金额' in df.columns else 0
+            abs_var = float(row['绝对差异'])
+            if budget == 0 and actual == 0:
+                budget = 0
+                actual = abs_var
+
             rel_raw = row.get('相对差异(%)')
-            rel_str = self._format_pct(rel_raw)
-            if isinstance(rel_raw, (int, float)) and not math.isnan(rel_raw) and not math.isinf(rel_raw):
-                rel_symbol = "+" if rel_raw >= 0 else ""
-                rel_str = f"{rel_symbol}{rel_raw:.2f}%"
+            if isinstance(rel_raw, (int, float)) and not math.isnan(rel_raw):
+                rel_ratio = rel_raw / 100
+                rel_str = self._format_pct_from_values(rel_ratio, budget, actual)
+            else:
+                rel_str = self._format_pct_from_values(None, budget, actual)
 
             cells = [
                 str(rank),
@@ -336,10 +378,14 @@ class MarkdownReporter:
             variance_symbol = "+" if row['累计偏离'] >= 0 else ""
             status = "✅" if row['累计偏离'] >= 0 else "⚠️"
 
+            cum_budget = float(row['累计预算'])
+            cum_actual = float(row['累计实际'])
             cum_rel_raw = row.get('累计相对偏离(%)')
-            cum_rel_str = self._format_pct(cum_rel_raw)
-            if isinstance(cum_rel_raw, (int, float)) and not math.isnan(cum_rel_raw) and not math.isinf(cum_rel_raw):
-                cum_rel_str = f"{cum_rel_raw:.2f}%"
+            if isinstance(cum_rel_raw, (int, float)) and not math.isnan(cum_rel_raw):
+                cum_rel_ratio = cum_rel_raw / 100
+                cum_rel_str = self._format_pct_from_values(cum_rel_ratio, cum_budget, cum_actual)
+            else:
+                cum_rel_str = self._format_pct_from_values(None, cum_budget, cum_actual)
 
             rows.append(
                 f"| {row['科目编码']} | {row['科目名称']} | {self._format_number(row['累计预算'])} | "
@@ -362,26 +408,33 @@ class MarkdownReporter:
 ## 六、说明
 
 1. **绝对差异** = 实际金额 - 预算金额
-2. **相对差异** = 绝对差异 / 预算金额 × 100%
-   - 预算为0时：实际>0 显示 `∞%`，实际<0 显示 `-∞%`，实际=0 显示 `N/A`
+2. **相对差异** = 绝对差异 / 预算金额 × 100%（内部统一用 NaN 表示除零）
+   - 预算为0 且 实际>0  → 显示 `∞%`
+   - 预算为0 且 实际<0  → 显示 `-∞%`
+   - 预算为0 且 实际=0  → 显示 `N/A`
 3. **累计偏离** = 自分析起始期间至当前期间的累计实际 - 累计预算
 4. **影响分数** = 绝对差异/期间总预算 × 70% + 相对差异 × 30%
-5. **异常分组排序**：
+5. **异常合并 Top-N 接口**：
+   - `detect_anomalies()` 一次返回超支+节省合并的完整 Top-N 列表
+   - `get_anomaly_groups(list)` 可再按「超支组/节省组」切片
+   - `anomalies_to_dataframe()` 含「分组」列，展示层直接渲染
+6. **异常分组排序**：
    - 超支组（不利）：收入未达预期 + 成本费用超支
    - 节省组（有利）：收入超预期 + 成本费用节省
    - 组内按绝对差异金额从大到小分别排序
-6. **Excel颜色分级**（三档可调，在 ReportConfig.excel_color_config 配置）：
+7. **Excel颜色分级**（三档可调，运营在 YAML `excel_colors` 节自定义企业色）：
    - 0 ~ ±{cc.level1_threshold*100:.0f}%：正常色（无色）
    - ±{cc.level1_threshold*100:.0f}% ~ ±{cc.level2_threshold*100:.0f}%：浅色
    - ±{cc.level2_threshold*100:.0f}% ~ ±{cc.level3_threshold*100:.0f}%：中色
    - > ±{cc.level3_threshold*100:.0f}%：深色（加粗）
-7. 报告中"【待核实】"标记的成因分析为系统自动生成的占位符
-   - 运营团队可在 `config/cause_templates.yaml` 中自定义模板
-   - 无需修改代码即可扩展或替换成因模板
-8. 本报告由财务差异报告生成器自动生成，如有疑问请联系财务部门
+8. **成因模板 YAML 校验**：
+   - 合法键：`revenue_unfavorable` / `revenue_favorable` / `cost_unfavorable` / `cost_favorable`
+   - 键名拼写错误会产生运行时警告（不会静默降级）
+9. 期间格式支持：`1月`...`12月` / `YYYY年第Q季度` / `YYYY年上半年` `YYYY年下半年` `H1` `H2`
+10. 本报告由财务差异报告生成器自动生成，如有疑问请联系财务部门
 
 ---
-*生成工具：财务差异报告生成器 v1.1*
+*生成工具：财务差异报告生成器 v1.2.0*
 """
 
     def _format_number(self, value: float) -> str:

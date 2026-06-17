@@ -1,0 +1,13 @@
+# 故意拼错字段用于测试严格校验
+revenue_unfavorabl:
+  - "【待核实】这个键名少了一个 e，会产生警告"
+
+cost_unfavorable:
+  - "【待核实】这个键名是正确的"
+
+some_unknown_key:
+  - "这个 key 完全不认识"
+
+excel_colors:
+  level1_threshold: 0.04
+  favorable_level1_bg: "#FF00FF"

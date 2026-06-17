@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import pandas as pd
 import re
 import math
@@ -8,6 +8,10 @@ import math
 class PeriodParser:
     """多期日期解析器，支持多种格式"""
 
+    HALF_PATTERN = re.compile(
+        r'(\d{4})\s*年?\s*(上半年|下半年|前半年|后半年|第一半年|第二半年|半年|H1|H2|上|下)',
+        re.IGNORECASE
+    )
     QUARTER_PATTERN = re.compile(
         r'(\d{4})\s*年\s*第\s*([1-4])\s*季度',
         re.IGNORECASE
@@ -18,6 +22,10 @@ class PeriodParser:
     YEAR_MONTH_PATTERN = re.compile(
         r'(\d{4})[\-/_年](\d{1,2})'
     )
+    HALF_SHORT_PATTERN = re.compile(
+        r'^H\s*([12])\s*(\d{4})$|^(\d{4})\s*H\s*([12])$',
+        re.IGNORECASE
+    )
 
     @staticmethod
     def parse(period_str: str) -> Tuple[float, str]:
@@ -26,11 +34,40 @@ class PeriodParser:
 
         支持格式：
         - "1月", "2月" ... "12月"
+        - "上半年", "下半年", "H1", "H2"
+        - "2024年上半年", "2024年下半年", "2024H1", "2024 H2", "2024年第一半年"
         - "2024年第1季度", "2024年第2季度" ...
         - "2024-01", "2024_01", "2024/01", "2024年01月"
-        - "Q1 2024", "2024 Q1"
         """
         s = str(period_str).strip()
+
+        m = PeriodParser.HALF_PATTERN.search(s)
+        if m:
+            year = int(m.group(1))
+            tag = m.group(2).lower()
+            half = 1
+            if tag in ('下', 'h2', '第二半年', '下半年', '后半年'):
+                half = 2
+            sort_key = year * 100 + 50 + half * 25
+            std_name = f"{year}年{'上' if half == 1 else '下'}半年"
+            return (sort_key, std_name)
+
+        m = PeriodParser.HALF_SHORT_PATTERN.search(s.replace(' ', ''))
+        if m:
+            if m.group(1):
+                half = int(m.group(1))
+                year = int(m.group(2))
+            else:
+                year = int(m.group(3))
+                half = int(m.group(4))
+            sort_key = year * 100 + 50 + half * 25
+            std_name = f"{year}年{'上' if half == 1 else '下'}半年"
+            return (sort_key, std_name)
+
+        if s in ('上半年', '第一半年', '前半年', '半年', 'H1', 'h1'):
+            return (50.0, '上半年')
+        if s in ('下半年', '第二半年', '后半年', 'H2', 'h2'):
+            return (75.0, '下半年')
 
         m = PeriodParser.QUARTER_PATTERN.search(s)
         if m:
@@ -110,18 +147,23 @@ class FinancialData:
 
 @dataclass
 class VarianceResult:
-    """差异计算结果"""
+    """差异计算结果
+
+    relative_variance 统一使用 float，异常除零情况用 NaN 表示，
+    展示层通过 budget/actual 值判断渲染为 ∞% 或 N/A，
+    确保 pandas DataFrame 列类型一致（float64）。
+    """
     account_code: str
     account_name: str
     period: str
     budget: float
     actual: float
     absolute_variance: float
-    relative_variance: Optional[float]
+    relative_variance: float
     cumulative_budget: float
     cumulative_actual: float
     cumulative_variance: float
-    cumulative_relative_variance: Optional[float]
+    cumulative_relative_variance: float
 
 
 @dataclass
@@ -131,7 +173,7 @@ class AnomalyItem:
     account_name: str
     period: str
     absolute_variance: float
-    relative_variance: Optional[float]
+    relative_variance: float
     impact_score: float
     cause_placeholder: str
     variance_type: str
@@ -139,7 +181,11 @@ class AnomalyItem:
 
 @dataclass
 class ExcelColorConfig:
-    """Excel单元格颜色三档阈值配置"""
+    """Excel单元格颜色三档阈值配置
+
+    所有配色均可由运营在 YAML config 中以企业色替换，
+    支持 from_dict() 从配置文件构造。
+    """
 
     level1_threshold: float = 0.05
     level2_threshold: float = 0.10
@@ -162,7 +208,16 @@ class ExcelColorConfig:
     neutral_bg: str = "#FFFFFF"
     neutral_font: str = "#000000"
 
-    def get_format_key(self, relative_variance: Optional[float]) -> str:
+    @classmethod
+    def from_dict(cls, d: Optional[Dict[str, Any]]) -> 'ExcelColorConfig':
+        """从字典构造（忽略未知键），用于 YAML 配置加载"""
+        if not d:
+            return cls()
+        known = {f.name for f in cls.__dataclass_fields__.values()}
+        clean = {k: v for k, v in d.items() if k in known}
+        return cls(**clean)
+
+    def get_format_key(self, relative_variance: float) -> str:
         """根据相对差异获取格式键"""
         if relative_variance is None or math.isnan(relative_variance):
             return 'neutral'

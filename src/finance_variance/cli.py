@@ -35,9 +35,9 @@ def cli():
 @click.option('--top-n', default=10, type=int,
               help='显示Top N异常 (默认: 10)')
 @click.option('--start-period', default=None,
-              help='分析起始期间，如"1月"或"2024年第1季度" (默认: 所有期间)')
+              help='分析起始期间，如"1月"、"2024年第1季度"、"2024年上半年" (默认: 所有期间)')
 @click.option('--end-period', default=None,
-              help='分析结束期间，如"6月"或"2024年第3季度" (默认: 所有期间)')
+              help='分析结束期间，如"6月"、"2024年第3季度"、"2025年下半年" (默认: 所有期间)')
 @click.option('--cause-templates', default=None, type=click.Path(),
               help='成因模板YAML配置文件路径 (默认: config/cause_templates.yaml)')
 @click.option('--separate-groups/--no-separate-groups', default=True,
@@ -141,23 +141,54 @@ def init_cause_templates(template_path):
             '【待核实】费用管控措施见效，各项开支节约',
             '【待核实】部分预算内项目延期至下期执行',
             '【待核实】产能利用率提升摊薄了单位固定成本'
-        ]
+        ],
+        'excel_colors': {
+            'level1_threshold': 0.05,
+            'level2_threshold': 0.10,
+            'level3_threshold': 0.20,
+            'favorable_level1_bg': '#E8F5E9',
+            'favorable_level1_font': '#2E7D32',
+            'favorable_level2_bg': '#A5D6A7',
+            'favorable_level2_font': '#1B5E20',
+            'favorable_level3_bg': '#43A047',
+            'favorable_level3_font': '#FFFFFF',
+            'unfavorable_level1_bg': '#FFEBEE',
+            'unfavorable_level1_font': '#C62828',
+            'unfavorable_level2_bg': '#EF9A9A',
+            'unfavorable_level2_font': '#7F0000',
+            'unfavorable_level3_bg': '#E53935',
+            'unfavorable_level3_font': '#FFFFFF',
+            'neutral_bg': '#FFFFFF',
+            'neutral_font': '#212121',
+        },
+        'note': (
+            '运营自定义说明：合法键为 revenue_unfavorable / revenue_favorable / '
+            'cost_unfavorable / cost_favorable / excel_colors。'
+            '键名拼写错误会产生警告。Excel 颜色请使用 6 位 HEX。'
+        )
     }
 
     with open(default_path, 'w', encoding='utf-8') as f:
         yaml.dump(default_templates, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
 
-    click.echo(f'✅ 默认成因模板已生成: {default_path}')
-    click.echo('📝 运营团队可直接编辑此文件自定义成因说明，无需修改代码。')
+    click.echo(f'✅ 默认配置（成因模板 + Excel 企业色）已生成: {default_path}')
+    click.echo('📝 运营团队可直接编辑此文件自定义成因与配色，无需修改代码。')
 
 
 @cli.command()
 def version():
     """显示版本信息"""
-    click.echo('财务差异报告生成器 v1.1.0')
+    click.echo('财务差异报告生成器 v1.2.0')
+    click.echo('')
+    click.echo('v1.2.0 补丁更新:')
+    click.echo('  • 调整: inf / None 统一语义为 NaN，pandas 列类型一致 (展示层通过 budget/actual 判读 ∞%/N/A)')
+    click.echo('  • 新增: 超支/节省合并 Top-N 接口，客户端一次取完整异常列表，附 get_anomaly_groups()')
+    click.echo('  • 新增: YAML 字段名校验加严，未知键产生警告 (防止运营写错字段后静默降级)')
+    click.echo('  • 新增: Excel 颜色 HEX 全部挪到 YAML excel_colors 节，运营可改企业色')
+    click.echo('  • 新增: 多期日期解析支持「上半年」「下半年」「H1」「H2」「YYYY年上半年」等格式')
     click.echo('')
     click.echo('v1.1.0 补丁更新:')
-    click.echo('  • 修复: 相对差异公式 budget=0 时返回 inf/None，避免 ZeroDivisionError')
+    click.echo('  • 修复: 相对差异公式 budget=0 时避免 ZeroDivisionError')
     click.echo('  • 新增: 异常排序拆分超支/节省两组，分别按金额排序')
     click.echo('  • 新增: 成因占位符挪到 YAML 配置，支持运营自定义')
     click.echo('  • 新增: Excel 单元格颜色阈值三档可调（config 配置）')
